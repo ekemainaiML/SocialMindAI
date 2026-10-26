@@ -77,15 +77,20 @@ minor tag; `restart: unless-stopped`; no secrets in the compose file.
 ## 4. Data model
 
 Entities (all prefixed `smos_`): the full 19-table set from the design document is created
-in Phase 1 migrations so later phases add columns, not tables.
+in Phase 1 migrations so later phases add columns, not tables. Two adjustments from the
+clarified Phase 1 spec: `scheduled_posts` + `published_posts` are merged into a single
+`platform_posts` (one independently managed post per target account), and Phase 1 adds
+`auth_attempts` (brute-force counters) and a durable `jobs` outbox. See
+`specs/001-phase-1-command-center/data-model.md`.
 
 | Table | Phase 1 use |
 |---|---|
 | `users`, `workspaces`, `memberships`, `invitations` | auth & RBAC |
+| `auth_attempts` | brute-force counters and lockouts (rolling window, per identity and per IP) |
 | `social_accounts`, `platform_tokens` | registry (token exchange in Phase 2) |
 | `campaigns`, `content_items`, `content_variants` | content domain |
 | `media_assets` | MinIO metadata only (no blobs in Postgres, P9) |
-| `scheduled_posts`, `published_posts` | scheduling & publish records |
+| `platform_posts` | one row per target account: schedule, dispatch, retry, outcome (merges `scheduled_posts` + `published_posts`) |
 | `comments`, `engagements` | created empty; Phase 2/6 fill |
 | `analytics_snapshots` | created empty; Phase 2/7 fill |
 | `agent_runs`, `agent_tasks`, `agent_memories` | created empty; Phase 4 fills |
@@ -99,9 +104,9 @@ workspaces 1—* social_accounts 1—1 platform_tokens
 workspaces 1—* campaigns 1—* content_items 1—* content_variants
 content_items 1—* media_assets (M:N via content_variant_media)
 content_items 1—* approval_requests
-content_variants 1—* scheduled_posts *—1 social_accounts
-scheduled_posts 1—0..1 published_posts
-published_posts 1—* engagements (comments, later)
+content_variants 1—* platform_posts *—1 social_accounts
+platform_posts 1—* jobs (one per attempt group)
+platform_posts 1—* engagements (comments, later)
 * → audit_events (polymorphic: entity_type, entity_id, actor_type, actor_id)
 ```
 
@@ -117,6 +122,11 @@ IDEA → RESEARCHED → DRAFT → AI_REVIEWED → HUMAN_REVIEW → APPROVED → 
 **Money/time conventions:** `timestamptz` in UTC, ISO-8601 at the API boundary; soft
 deletion via `deleted_at`; every table has `id (uuid)`, `workspace_id`, `created_at`,
 `updated_at`.
+
+**Timezone:** one IANA timezone per workspace (`workspaces.timezone`, validated on
+write). Instants are stored and dispatched in UTC; the workspace timezone is a display
+and input concern only — changing it never reschedules an existing post (Phase 1 spec
+FR-026).
 
 **Tokens:** `platform_tokens(encrypted_access_token, encrypted_refresh_token,
 token_expires_at, scopes, last_refreshed_at)` — AES-GCM via `ENCRYPTION_KEY` (P9).
@@ -135,8 +145,9 @@ worker claims with `FOR UPDATE SKIP LOCKED` so a crash never loses a job.
 | `notify` | approval created, publish outcome | in-app notification + email via Mailpit/SMTP |
 | `reconcile_schedule` | on worker boot | re-enqueue future posts missed during downtime |
 | `retry` | exponential backoff 5s/30s/2m/10m, max 4 attempts | then `FAILED` + operator notification |
+| `purge_retention` | daily | soft-deleted content > 30 d, notifications > 90 d, `auth_attempts` > 24 h — and nothing else |
 
-Idempotency: `jobs.idempotency_key = (post_id, scheduled_at, attempt_group)`; duplicate
+Idempotency: `jobs.idempotency_key = (platform_post_id, attempt_group)`; duplicate
 dispatch is impossible. The scheduler (`APScheduler`/cron) only *enqueues*; only the
 worker *executes*.
 
@@ -177,6 +188,10 @@ Hot reload: `api` and `web` mount source volumes in `docker-compose.override.yml
 
 - Argon2id password hashing; short-lived session cookie, `HttpOnly`/`SameSite=Lax`,
   rotation on privilege change; CSRF token for cookie-authenticated mutations.
+- Failed sign-ins: 10 failures per account in a rolling 15-minute window locks the
+  account for 15 minutes; counters live in Postgres (`auth_attempts`) so a cache flush
+  cannot unlock an attacker, IP throttling is independent, and every auth error returns
+  the same generic message (P10 of the clarified spec).
 - RBAC checked in the service layer, never only in the UI (P7 pattern).
 - Every query scoped by `workspace_id` from the session — never from request bodies.
 - Upload limits, MIME allow-list, content-derived filenames; blobs served via short-lived

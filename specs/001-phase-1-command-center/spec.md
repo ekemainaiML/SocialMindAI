@@ -15,6 +15,54 @@ silently accepted.
 **Baseline**: this feature covers all of [docs/PHASE-1-SPEC.md](../../docs/PHASE-1-SPEC.md),
 which remains the human-readable baseline. Where wording differs, this spec governs.
 
+## Clarifications
+
+### Session 2026-10-26
+
+- Q: When scheduling content, does one scheduled post target a single social account, or
+  can it fan out to several accounts at once? → A: Fan-out into child posts. The operator
+  multi-selects accounts once; each selection expands into an independent post carrying
+  its own variant, schedule, approval, retry policy, status, external reference and
+  analytics. The master `ContentItem` stays separate from its posts, and bulk actions
+  ("same schedule for all", bulk approval) are conveniences only — never a requirement
+  that all posts succeed or publish together.
+- Follow-on for the plan step: `docs/ARCHITECTURE.md` and `docs/API-CONTRACTS.md` still
+  model scheduling as `scheduled_posts → published_posts`; they must be reconciled with
+  `PlatformPost` before implementation (contract-first, P11).
+- Q: When two posts target the same social account too close together, what should the
+  system do in Phase 1? → A: Block by default, overridable by an owner. Scheduling is
+  checked transactionally against a configurable per-account spacing window (default
+  60 minutes, exact same-time collisions included); a clash rejects the request naming
+  the conflicting post, account and time. An owner may override, but only with a
+  non-empty reason that is recorded in the audit trail with the conflicting posts,
+  account, timestamps and decision. Spacing is per social account, never global, and
+  editing or rescheduling re-runs the check.
+- Q: What failed sign-in protection should the Phase 1 spec require? → A: Rate-limit
+  plus a short lockout. 10 failed attempts per account within a rolling 15-minute window
+  locks that account for 15 minutes; per-IP request throttling runs independently of it.
+  Thresholds are configurable and enforced atomically so concurrent requests cannot
+  bypass them. Invalid credentials and locked accounts return the same generic error, so
+  account existence never leaks. Failures, lockouts, throttles, unlocks and the recovery
+  path are audited, the failure counter resets on successful sign-in, and a legitimate
+  user can recover without an administrator intervening each time. Not deferred — this
+  is Phase 1, because the system holds platform credentials and publishing rights.
+- Q: How should Phase 1 handle data retention and backups? → A: Fixed retention at the
+  stated defaults plus a tested backup/restore procedure. Audit events, content and
+  publish records are kept indefinitely; soft-deleted content is purged after 30 days;
+  notifications after 90. Backups cover the database and the media store together with
+  coordinated consistency, include an integrity check before a backup counts as
+  successful, are stored encrypted without plaintext credentials, and are restored into
+  a clean environment and verified usable as an acceptance test. Backup snapshot
+  retention is configurable and documented. Per-workspace retention configuration is
+  deferred to a later phase.
+- Q: Whose timezone governs scheduling times and the calendar display in Phase 1? → A:
+  The workspace timezone only. Each workspace holds one configured IANA timezone (e.g.
+  `Africa/Lagos`), which governs calendar display, scheduling input and all displayed
+  times. Instants are stored in UTC and published against that instant, never against
+  server-local time; API responses carry timezone-aware timestamps. Changing the
+  workspace timezone changes how existing instants are displayed, never when they fire.
+  Per-user display preferences are deferred.
+
 ## Phase Gate *(Social OS preset — mandatory)*
 
 - **Phase**: 1 — command center.
@@ -69,6 +117,16 @@ and landing page; with no session, confirm every private route refuses.
    the request is refused with no data returned.
 4. **Given** an expired or revoked session, **When** a request is made, **Then** it is
    refused and the user is returned to sign-in.
+5. **Given** nine failed sign-ins on one account, **When** a tenth is attempted within
+   the rolling window, **Then** the account locks for the configured period, the
+   response is indistinguishable from a wrong password, and the failures plus lockout
+   are audited.
+6. **Given** a locked account, **When** the lockout period expires, **Then** sign-in
+   works again without administrator intervention, and a successful sign-in resets the
+   failure counter.
+7. **Given** many requests from one IP address, **When** they exceed the throttle,
+   **Then** they are limited independently of any account lockout, without affecting
+   other users behind the same address.
 
 ---
 
@@ -197,8 +255,9 @@ the change and its conflict warning.
 2. **Given** a scheduled post, **When** its time is changed, **Then** the new time is
    stored, recorded in the audit history, and a clash with another post on the same
    account and time is surfaced before confirmation.
-3. **Given** a scheduled post in a timezone other than the workspace default, **When**
-   the grid renders, **Then** it appears on the correct local day.
+3. **Given** posts scheduled in the workspace timezone, **When** the month or week view
+   renders across a midnight boundary, **Then** each appears on the workspace-local date
+   it was entered for, with its platform and status.
 
 ---
 
@@ -277,6 +336,13 @@ notification.
    restart, **Then** it is not published a second time.
 5. **Given** a job whose time passed while the system was down, **When** the system
    recovers, **Then** overdue jobs are reconciled rather than lost or fired twice.
+6. **Given** one content item selected for three accounts, **When** it is scheduled,
+   **Then** three independent posts are created — each with its own variant, schedule,
+   approval, retry policy and outcome — and editing or failing one leaves the others
+   untouched.
+7. **Given** several posts selected together, **When** a shared schedule or bulk
+   approval is applied, **Then** each resulting post is still independently editable,
+   reschedulable and reported on afterwards.
 
 ---
 
@@ -352,13 +418,23 @@ by entity and date and confirm every action appears.
   than attempting a partial publish.
 - Two users approve, reject or reschedule the same item concurrently → last-write-wins
   is prevented; the conflict is surfaced and both actions are audited.
-- Two posts target the same account at the same minute → a conflict is surfaced before
-  confirmation, and configurable spacing rules may block it.
+- Two posts target the same account within the spacing window → scheduling is rejected
+  naming the conflicting post, account and time; an owner may override with a reason
+  that is audited. Posts on different accounts at the same time never conflict.
+- Two scheduling requests for the same account race each other → the conflict check
+  runs inside the same transaction as the write, so neither slips past the rule.
+- An owner with override rights leaves → the spacing rule still blocks for everyone
+  else; overrides stay visible in the audit trail.
 - An approval is left pending indefinitely → it ages visibly on the dashboard and does
   not silently expire.
 - Content is edited after approval → refused; it must return to draft first.
-- Daylight-saving transitions and workspace/user timezone differences → a post scheduled
-  for a local wall-clock time publishes at the intended instant, not an hour off.
+- Daylight-saving transitions → a post scheduled for a local wall-clock time publishes
+  at the intended instant, not an hour off, because the workspace timezone is an IANA
+  identifier rather than a fixed offset.
+- The workspace timezone is changed → existing scheduled instants stay exactly when
+  they were; only their displayed local time changes.
+- The workspace timezone is missing or invalid → configuration is rejected rather than
+  silently falling back to server time.
 - Media upload interrupted mid-transfer → no partial asset is listed or usable.
 - A user's session expires while they are editing → their work is not silently
   submitted under a dead session, and they are returned to sign-in.
@@ -366,13 +442,26 @@ by entity and date and confirm every action appears.
   against their current role at submission time, not at page load.
 - An account's capability set shrinks after a platform policy change → content targeting
   a now-unavailable capability is blocked before scheduling, not at publish time.
+- An attacker or a typo locks a legitimate user out → the lock is short, self-service
+  recovery is available and audited, and repeated lockouts cannot be used to deny an
+  account service indefinitely.
+- A backup succeeds but the media store is incomplete → integrity verification fails
+  the backup, and a restore whose media references dangle is rejected as unusable.
+- A purge job runs against a partially unavailable store → it aborts rather than
+  deleting anything it cannot fully evaluate, leaving the policy's records intact.
 
 ## Requirements *(mandatory)*
 
 ### Functional Requirements
 
 - **FR-001**: The system MUST authenticate users by email and password, maintain
-  revocable sessions, and refuse every private route without one.
+  revocable sessions, and refuse every private route without one. It MUST lock an account
+  after 10 failed attempts in a rolling 15-minute window for 15 minutes, throttle
+  requests per IP independently of account state, keep all authentication errors
+  identical and non-revealing, enforce both counters atomically against concurrent
+  attempts, reset the failure count on successful sign-in, and audit every failure,
+  lockout, throttle, unlock and recovery — with thresholds configurable and an audited
+  self-service recovery path for legitimately locked-out users.
 - **FR-002**: The system MUST support workspaces containing members with the roles
   `owner`, `editor` and `viewer`, plus invitations that can be accepted exactly once.
 - **FR-003**: The system MUST enforce those roles on every mutating operation, with
@@ -423,6 +512,32 @@ by entity and date and confirm every action appears.
 - **FR-021**: The system MUST emit domain events (`content.approved`,
   `post.published`, `engagement.received`) for later phases to subscribe to, without
   any subscriber in Phase 1.
+- **FR-022**: The system MUST allow a content item to be scheduled to several social
+  accounts in one action, expanding into one independent post per account; each post
+  MUST own its variant, schedule, approval, retry policy, status and outcome, and bulk
+  operations MUST NOT couple their success or failure.
+- **FR-023**: The system MUST enforce a configurable per-account minimum spacing
+  window (default 60 minutes, including exact same-time collisions) as part of the
+  scheduling and rescheduling transaction, rejecting a conflicting request by default
+  with the conflicting post, account and time named; only an owner may override, and
+  only with a non-empty reason recorded in the audit trail. Posts targeting different
+  accounts MUST NOT conflict with one another.
+
+- **FR-024**: The system MUST apply fixed retention — audit events, content and
+  publish records kept indefinitely; soft-deleted content purged after 30 days;
+  notifications after 90 days — and purge jobs MUST NOT delete records outside those
+  policies.
+- **FR-025**: The system MUST provide a documented, scripted backup and restore
+  procedure covering the database and the media store with coordinated consistency,
+  integrity verification before a backup is considered successful, encrypted backup
+  storage with no plaintext credentials included, and a tested restore into a clean
+  environment that reproduces content, schedules, audit records and media in usable
+  condition.
+- **FR-026**: The system MUST configure one IANA timezone per workspace that governs
+  calendar display, scheduling input and all displayed times; MUST store and act on UTC
+  instants so publication never depends on server-local time; MUST return
+  timezone-aware timestamps; MUST reject a missing or invalid workspace timezone; and
+  MUST treat a workspace timezone change as a display change only, never a reschedule.
 
 ### Key Entities
 
@@ -440,10 +555,12 @@ by entity and date and confirm every action appears.
   and limit validation.
 - **MediaAsset**: an uploaded file's metadata (type, size, checksum, storage key);
   the bytes live in object storage.
-- **ScheduledPost**: the intent to publish a variant to an account at a time, with
-  status, attempt history and at-most-once key.
-- **PublishedPost**: the record of an actual publication — outcome, external
-  reference, dry-run flag, error detail.
+- **PlatformPost**: one independently managed publication targeting exactly one social
+  account — its own content variant, schedule, approval, attempt history, retry policy,
+  status, at-most-once key, external reference, dry-run flag and outcome. Selecting
+  several accounts for one content item creates one `PlatformPost` per account, linked
+  back to the same `ContentItem`. This is the unit scheduling, publishing, notification
+  and analytics all operate on.
 - **ApprovalRequest**: a pending decision on content — requester, approver, decision,
   comment, timestamp.
 - **Notification**: an in-app/email message with read state.
@@ -471,6 +588,20 @@ by entity and date and confirm every action appears.
 - **SC-008**: 100% of domain data survives a service restart, an upgrade and a full redeployment from the same configuration.
 - **SC-009**: 90% of the first-time evaluation tasks in the acceptance criteria are
   completed by a tester without consulting documentation beyond the README.
+- **SC-010**: Every conflicting scheduling attempt is rejected — 100% of conflict
+  tests pass, including concurrent same-account requests, and every override appears in
+  the audit trail with its reason.
+- **SC-011**: 100% of the brute-force protection tests pass — nine failures never lock,
+  the tenth does, IP throttling stays independent of account lockout, no error reveals
+  whether an account exists, and no sequence of concurrent requests bypasses a
+  threshold.
+- **SC-012**: A backup taken from a running instance restores into a clean deployment
+  with every content item, schedule, approval, audit record and media file present and
+  usable — verified by an automated restore test, and a failed backup is reported as
+  failed rather than passing silently.
+- **SC-013**: Retention purges remove only what the policy allows — 100% of purge tests
+  show audit, content and publish records untouched and the policy's own targets
+  removed.
 
 ## Assumptions
 
@@ -485,21 +616,22 @@ by entity and date and confirm every action appears.
 - Platform publishing is exercised only through the dry-run adapter; no third-party API
   is called in Phase 1.
 - Media is limited to common image and video formats with a configurable size ceiling.
-- Scheduling times are stored and compared as instants with the workspace timezone used
-  for display.
+- Scheduling times are entered in the workspace timezone, stored as UTC instants and
+  compared as instants; no per-user timezone preference exists in Phase 1.
 - The seed script's data is clearly marked as demo content.
 
 ## Deferred Capability Declaration *(Social OS preset)*
 
 | Later phase | Capability deliberately not implemented | Extension point this spec leaves behind |
 |---|---|---|
-| Phase 2 | Real publishing to X / LinkedIn / Facebook / Instagram; OAuth token exchange; reading comments and analytics | Adapter interface with a capability matrix, dry-run adapter, encrypted token columns, `PublishedPost`/`Engagement`/`AnalyticsSnapshot` records |
+| Phase 2 | Real publishing to X / LinkedIn / Facebook / Instagram; OAuth token exchange; reading comments and analytics | Adapter interface with a capability matrix, dry-run adapter, encrypted token columns, `PlatformPost`/`Engagement`/`AnalyticsSnapshot` records |
 | Phase 3 | AI drafting, rewriting, platform adaptation, classification | The `AI_REVIEWED` state traversed without a model, plus the model-provider interface and `agent_runs`/`agent_tasks` tables |
 | Phase 4 | Strategist, Researcher, Content, Engagement and Analytics agents with an orchestrator | Role/permission model, agent run tables, event hooks, feedback path reserved |
 | Phase 5 | Automated workflows, scheduled research, report generation | Domain events emitted by the API and a cron-shaped durable job runner with no scheduled producers |
 | Phase 6 | Comment classification, sentiment/intent analysis, automated replies | `Engagement` entity, policy defaults for risky categories, human-only routing rules |
 | Phase 7 | Performance learning and memory feedback into strategy | `AnalyticsSnapshot` and memory tables, event hooks, scoring fields left empty |
 | Later | Media generation (image/video) | `MediaAsset` provenance field distinguishing uploaded from generated |
+| Later | Per-workspace retention configuration | Retention values read from a single policy configuration that later becomes per-workspace |
 
 ## Constitution Compliance Record *(Social OS preset)*
 

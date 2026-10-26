@@ -40,7 +40,7 @@ Run against seeded data; each step asserts on API response *and* visible UI stat
 | AC-3.7 | `editor` attempting approval → `403`; `owner` approving → `APPROVED` + audit row | API test |
 | AC-3.8 | Scheduling unapproved content → `422 APPROVAL_REQUIRED`; approved → `201` | API test |
 | AC-3.9 | Calendar shows the scheduled post on the correct date | E2E test |
-| AC-3.10 | Publish worker dispatches at `scheduled_at` (within 15 s) via `DryRunAdapter`, writes `published_posts` with `dry_run=true` and an audit event | integration test with fake clock |
+| AC-3.10 | Publish worker dispatches at `scheduled_at` (within 15 s) via `DryRunAdapter`, writes one `platform_posts` row per target account with `dry_run=true` and an audit event | integration test with fake clock |
 | AC-3.11 | Simulated adapter failure → retries at documented backoff → `FAILED` + operator notification | integration test |
 | AC-3.12 | Duplicate `Idempotency-Key` does not double-publish | API test |
 | AC-3.13 | Notification appears in-app and in Mailpit | E2E test + mail log |
@@ -67,7 +67,8 @@ Run against seeded data; each step asserts on API response *and* visible UI stat
 | AC-5.5 | DB dump shows ciphertext for `platform_tokens`, never plaintext | query |
 | AC-5.6 | `.env` is git-ignored; `.env.example` contains placeholders only | `git status`/`git check-ignore` |
 | AC-5.7 | Errors returned to clients contain no stack traces or internals | negative test |
-| AC-5.8 | Rate limit triggers login lockout behaviour (`429` after 5 failures) | API test |
+| AC-5.8 | Failed-sign-in lockout: 9 failures do not lock, the 10th in a rolling 15 min locks for 15 min (`429`), errors are identical for unknown account and wrong password, and lockout/unlock are audited | API test |
+| AC-5.9 | Per-IP throttling is independent of the account lockout, and concurrent failed logins cannot bypass either threshold | API test + concurrency test |
 
 ## AC-6 Scheduling reliability
 
@@ -78,6 +79,9 @@ Run against seeded data; each step asserts on API response *and* visible UI stat
 | AC-6.3 | `reconcile_schedule` on worker boot enqueues posts missed during downtime | integration test |
 | AC-6.4 | Same post never dispatched twice (idempotency across worker restarts) | integration test |
 | AC-6.5 | Clock/timezone handling: DST-crossing schedules resolve correctly | unit tests |
+| AC-6.6 | Fan-out to N accounts creates N independent `platform_posts`, each with its own schedule, retry and outcome | API test |
+| AC-6.7 | Same-account spacing conflict → `409` naming the clash; owner override requires a reason and is audited; a different account at the same time is accepted | API test |
+| AC-6.8 | Calendar and API present times in the workspace IANA timezone; changing it re-displays without rescheduling | E2E + API test |
 
 ## AC-7 Failure recovery
 
@@ -87,6 +91,8 @@ Run against seeded data; each step asserts on API response *and* visible UI stat
 | AC-7.2 | Worker crash mid-job → job is re-claimed and completes exactly once | integration test |
 | AC-7.3 | Adapter failure → bounded retries, then `FAILED` + notification, never silent loss | integration test |
 | AC-7.4 | Corrupt/oversized upload rejected without partial row or orphan blob | API test |
+| AC-7.5 | `scripts/backup.sh` succeeds with a verified manifest; `scripts/restore.sh` into a clean environment reproduces content, schedules, audit rows and media (`verify_restore.sh` exit 0) | scripted run |
+| AC-7.6 | Retention purge removes only soft-deleted content > 30 d, notifications > 90 d and `auth_attempts` > 24 h — nothing else | integration test |
 | AC-7.5 | Migration rollback (`downgrade -1` → `upgrade head`) succeeds on seeded data | migration test |
 
 ## AC-8 Reproducible deployment
